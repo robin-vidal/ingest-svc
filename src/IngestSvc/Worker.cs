@@ -1,3 +1,4 @@
+using IngestSvc.Naming;
 using IngestSvc.Watching;
 using Microsoft.Extensions.Options;
 
@@ -8,15 +9,18 @@ public class Worker : BackgroundService
     private readonly ILogger<Worker> _logger;
     private readonly IOptions<WatcherOptions> _options;
     private readonly IFileSystemWatcherFactory _factory;
+    private readonly IPhotoNamer _namer;
 
     public Worker(
         ILogger<Worker> logger,
         IOptions<WatcherOptions> options,
-        IFileSystemWatcherFactory factory)
+        IFileSystemWatcherFactory factory,
+        IPhotoNamer namer)
     {
         _logger = logger;
         _options = options;
         _factory = factory;
+        _namer = namer;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -35,7 +39,8 @@ public class Worker : BackgroundService
     private async void OnFileCreated(object sender, FileSystemEventArgs e)
     {
         await WaitForFileReadyAsync(e.FullPath);
-        _logger.LogInformation("Detected file: {Path}", e.FullPath);
+        var storageKey = _namer.Generate();
+        _logger.LogInformation("Detected file: {Path} -> storage key: {Key}", e.FullPath, storageKey);
     }
 
     internal static async Task WaitForFileReadyAsync(
