@@ -34,6 +34,16 @@ public class Worker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        if (!string.IsNullOrWhiteSpace(_options.Value.ProcessedPath))
+        {
+            Directory.CreateDirectory(_options.Value.ProcessedPath);
+        }
+
+        if (!string.IsNullOrWhiteSpace(_options.Value.FailedPath))
+        {
+            Directory.CreateDirectory(_options.Value.FailedPath);
+        }
+
         using var watcher = _factory.Create(_options.Value.Path);
         watcher.Filter = "*.jpg";
         watcher.NotifyFilter = NotifyFilters.FileName;
@@ -47,30 +57,64 @@ public class Worker : BackgroundService
 
     private async void OnFileCreated(object sender, FileSystemEventArgs e)
     {
-        await WaitForFileReadyAsync(e.FullPath);
+        try
+        {
+            await ProcessFileAsync(e.FullPath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unhandled exception while handling created event for {Path}", e.FullPath);
+        }
+    }
+
+    internal async Task ProcessFileAsync(string fullPath)
+    {
+        await WaitForFileReadyAsync(fullPath);
         var key = _namer.Generate();
-        _logger.LogInformation("Detected {Path} -> key {Key}", e.FullPath, key);
+        _logger.LogInformation("Detected {Path} -> key {Key}", fullPath, key);
+
+        bool uploadSuccess = false;
 
         await _semaphore.WaitAsync();
         try
         {
-            using var file = File.OpenRead(e.FullPath);
-            using var fullRes = new MemoryStream();
-            await file.CopyToAsync(fullRes);
+            using (var file = File.OpenRead(fullPath))
+            {
+                using var fullRes = new MemoryStream();
+                await file.CopyToAsync(fullRes);
 
-            using var forResize = new MemoryStream(fullRes.ToArray());
-            using var lowRes = _resizer.Resize(forResize);
+                using var forResize = new MemoryStream(fullRes.ToArray());
+                using var lowRes = _resizer.Resize(forResize);
 
-            fullRes.Seek(0, SeekOrigin.Begin);
-            await _uploader.UploadAsync(key, fullRes, lowRes);
+                fullRes.Seek(0, SeekOrigin.Begin);
+                await _uploader.UploadAsync(key, fullRes, lowRes);
+                uploadSuccess = true;
+            }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to process {Path}", e.FullPath);
+            _logger.LogError(ex, "Failed to process {Path}", fullPath);
         }
         finally
         {
             _semaphore.Release();
+        }
+
+        var destFolder = uploadSuccess ? _options.Value.ProcessedPath : _options.Value.FailedPath;
+
+        if (string.IsNullOrWhiteSpace(destFolder))
+        {
+            return;
+        }
+
+        try
+        {
+            var destPath = Path.Combine(destFolder, Path.GetFileName(fullPath));
+            File.Move(fullPath, destPath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to move file {Path} to {Destination}", fullPath, destFolder);
         }
     }
 
