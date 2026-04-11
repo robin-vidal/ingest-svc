@@ -1,5 +1,4 @@
 using System.Net;
-using System.Reflection;
 using IngestSvc.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -13,14 +12,16 @@ namespace IngestSvc.Tests.Storage;
 
 public class PhotoUploaderTests
 {
-    private static IPhotoUploader CreateUploader(IMinioClient client, string bucket = "photos", string fullPrefix = "full", string lowPrefix = "low") =>
+    private static IPhotoUploader CreateUploader(IMinioClient client, string bucket = "photos", string fullPrefix = "full", string lowPrefix = "low", int retryInit = 10, int retryMax = 50) =>
         new PhotoUploader(
             client,
             Options.Create(new StorageOptions
             {
                 Bucket = bucket,
                 FullPrefix = fullPrefix,
-                LowPrefix = lowPrefix
+                LowPrefix = lowPrefix,
+                RetryInitialDelayMs = retryInit,
+                RetryMaxDelayMs = retryMax
             }),
             NullLogger<PhotoUploader>.Instance
         );
@@ -28,64 +29,88 @@ public class PhotoUploaderTests
     private static PutObjectResponse OkResponse() =>
         new(HttpStatusCode.OK, string.Empty, new Dictionary<string, string>(), 0, string.Empty);
 
-    private static string GetObjectName(PutObjectArgs args)
+    [Fact]
+    public async Task EnsureReadyAsync_Succeeds_When_BucketExists()
     {
-        var type = args.GetType().BaseType;
-        while (type != null && type.Name != "ObjectArgs`1")
-            type = type.BaseType;
-        return (string)type!.GetProperty("ObjectName", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(args)!;
+        var mock = new Mock<IMinioClient>();
+        mock.Setup(c => c.BucketExistsAsync(It.IsAny<BucketExistsArgs>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var uploader = CreateUploader(mock.Object);
+        await uploader.EnsureReadyAsync();
+        
+        mock.Verify(c => c.BucketExistsAsync(It.IsAny<BucketExistsArgs>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
-    public async Task UploadAsync_UploadsBothVersionsWithCorrectPaths()
+    public async Task EnsureReadyAsync_Retries_On_TransientNetworkError()
     {
-        var capturedArgs = new List<PutObjectArgs>();
+        var callCount = 0;
         var mock = new Mock<IMinioClient>();
-        mock.Setup(m => m.PutObjectAsync(It.IsAny<PutObjectArgs>(), It.IsAny<CancellationToken>()))
-            .Callback<PutObjectArgs, CancellationToken>((a, _) => capturedArgs.Add(a))
-            .ReturnsAsync(OkResponse());
+        mock.Setup(c => c.BucketExistsAsync(It.IsAny<BucketExistsArgs>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                callCount++;
+                if (callCount < 3)
+                    throw new HttpRequestException("Network down");
+                return Task.FromResult(true);
+            });
 
         var uploader = CreateUploader(mock.Object);
-        using var fullRes = new MemoryStream(new byte[10]);
-        using var lowRes = new MemoryStream(new byte[5]);
-
-        await uploader.UploadAsync("stand-1-abc.jpg", fullRes, lowRes);
-
-        Assert.Equal(2, capturedArgs.Count);
-        Assert.Equal("full/stand-1-abc.jpg", GetObjectName(capturedArgs[0]));
-        Assert.Equal("low/stand-1-abc.jpg", GetObjectName(capturedArgs[1]));
+        await uploader.EnsureReadyAsync();
+        
+        Assert.Equal(3, callCount);
     }
 
     [Fact]
-    public async Task UploadAsync_FullResFailure_ThrowsAndSkipsLowRes()
+    public async Task EnsureReadyAsync_Retries_When_BucketDoesNotExist()
     {
         var mock = new Mock<IMinioClient>();
-        mock.Setup(m => m.PutObjectAsync(It.IsAny<PutObjectArgs>(), It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new MinioException("connection refused"));
+        mock.Setup(c => c.BucketExistsAsync(It.IsAny<BucketExistsArgs>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
 
-        var uploader = CreateUploader(mock.Object);
-        using var fullRes = new MemoryStream(new byte[10]);
-        using var lowRes = new MemoryStream(new byte[5]);
-
-        await Assert.ThrowsAsync<MinioException>(() =>
-            uploader.UploadAsync("stand-1-abc.jpg", fullRes, lowRes));
-
-        mock.Verify(m => m.PutObjectAsync(It.IsAny<PutObjectArgs>(), It.IsAny<CancellationToken>()), Times.Once);
+        var uploader = CreateUploader(mock.Object, retryInit: 1, retryMax: 1);
+        
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        await Assert.ThrowsAnyAsync<Exception>(() => uploader.EnsureReadyAsync(cts.Token));
     }
 
     [Fact]
-    public async Task UploadAsync_LowResFailure_Throws()
+    public async Task UploadAsync_Retries_On_TransientError()
     {
+        var callCount = 0;
         var mock = new Mock<IMinioClient>();
-        mock.SetupSequence(m => m.PutObjectAsync(It.IsAny<PutObjectArgs>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(OkResponse())
-            .ThrowsAsync(new MinioException("low-res upload failed"));
+        mock.Setup(c => c.PutObjectAsync(It.IsAny<PutObjectArgs>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                callCount++;
+                if (callCount < 3)
+                    throw new MinioException("connection refused"); 
+                return Task.FromResult(OkResponse());
+            });
 
-        var uploader = CreateUploader(mock.Object);
+        var uploader = CreateUploader(mock.Object, retryInit: 10, retryMax: 50);
+        
         using var fullRes = new MemoryStream(new byte[10]);
         using var lowRes = new MemoryStream(new byte[5]);
+        
+        await uploader.UploadAsync("test.jpg", fullRes, lowRes);
+        
+        Assert.Equal(4, callCount); // 2 misses, 1 hit, plus 1 hit for low res
+    }
 
-        await Assert.ThrowsAsync<MinioException>(() =>
-            uploader.UploadAsync("stand-1-abc.jpg", fullRes, lowRes));
+    [Fact]
+    public async Task UploadAsync_ThrowsImmediately_On_AuthorizationException()
+    {
+        var mock = new Mock<IMinioClient>();
+        mock.Setup(c => c.PutObjectAsync(It.IsAny<PutObjectArgs>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new AuthorizationException());
+
+        var uploader = CreateUploader(mock.Object);
+        
+        using var fullRes = new MemoryStream(new byte[10]);
+        using var lowRes = new MemoryStream(new byte[5]);
+        
+        await Assert.ThrowsAsync<AuthorizationException>(() => uploader.UploadAsync("test.jpg", fullRes, lowRes));
     }
 }

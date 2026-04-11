@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using IngestSvc.Naming;
 using IngestSvc.Resizing;
 using IngestSvc.Storage;
@@ -8,6 +9,7 @@ namespace IngestSvc;
 
 public class Worker : BackgroundService
 {
+    private readonly ConcurrentDictionary<string, byte> _processingFiles = new();
     private readonly ILogger<Worker> _logger;
     private readonly IOptions<WatcherOptions> _options;
     private readonly IFileSystemWatcherFactory _factory;
@@ -44,26 +46,81 @@ public class Worker : BackgroundService
             Directory.CreateDirectory(_options.Value.FailedPath);
         }
 
+        _logger.LogInformation("Waiting for MinIO to become ready...");
+        try 
+        {
+            await _uploader.EnsureReadyAsync(stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogCritical(ex, "Failed to ensure MinIO readiness. Shutting down worker.");
+            throw;
+        }
+
         using var watcher = _factory.Create(_options.Value.Path);
         watcher.Filter = "*.jpg";
         watcher.NotifyFilter = NotifyFilters.FileName;
+        watcher.InternalBufferSize = 65536; // Handle huge bursts up to ~1000 files
         watcher.Created += OnFileCreated;
         watcher.EnableRaisingEvents = true;
 
         _logger.LogInformation("Watching {Path}", _options.Value.Path);
 
+        // Sweep periodically in the background for any missed events or timeouts
+        _ = Task.Run(async () =>
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
+            SweepDirectory();
+
+            while (await timer.WaitForNextTickAsync(stoppingToken))
+            {
+                SweepDirectory();
+            }
+        }, stoppingToken);
+
         await Task.Delay(Timeout.Infinite, stoppingToken);
     }
 
-    private async void OnFileCreated(object sender, FileSystemEventArgs e)
+    private void SweepDirectory()
     {
         try
         {
-            await ProcessFileAsync(e.FullPath);
+            foreach (var existingFile in Directory.GetFiles(_options.Value.Path, "*.jpg"))
+            {
+                _ = Task.Run(() => ProcessSafeAsync(existingFile));
+            }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unhandled exception while handling created event for {Path}", e.FullPath);
+            _logger.LogWarning(ex, "Failed to perform directory sweep.");
+        }
+    }
+
+    private void OnFileCreated(object sender, FileSystemEventArgs e)
+    {
+        _ = Task.Run(() => ProcessSafeAsync(e.FullPath));
+    }
+
+    private async Task ProcessSafeAsync(string fullPath)
+    {
+        if (!_processingFiles.TryAdd(fullPath, 0))
+            return; // Already being processed by sweep or watcher
+
+        try
+        {
+            await ProcessFileAsync(fullPath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Fatal error on {Path}", fullPath);
+        }
+        finally
+        {
+            _processingFiles.TryRemove(fullPath, out _);
         }
     }
 
@@ -120,7 +177,7 @@ public class Worker : BackgroundService
 
     internal static async Task WaitForFileReadyAsync(
         string path,
-        int maxAttempts = 30,
+        int maxAttempts = 240, // 2 minutes timeout to support massive parallel copying
         int delayMs = 500)
     {
         long previousSize = -1;
@@ -132,13 +189,20 @@ public class Worker : BackgroundService
                 long currentSize = new FileInfo(path).Length;
 
                 if (currentSize > 0 && currentSize == previousSize)
+                {
+                    using var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None);
                     return;
+                }
 
                 previousSize = currentSize;
             }
             catch (IOException)
             {
                 // File not yet accessible
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // File permissions being set
             }
 
             await Task.Delay(delayMs);

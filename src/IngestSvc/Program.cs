@@ -24,6 +24,13 @@ builder.Services.AddSingleton<IPhotoUploader, PhotoUploader>();
 var storageConfig = builder.Configuration.GetSection("Storage").Get<StorageOptions>()
     ?? throw new InvalidOperationException("Storage configuration is required");
 
+if (string.IsNullOrWhiteSpace(storageConfig.Endpoint) || 
+    string.IsNullOrWhiteSpace(storageConfig.AccessKey) || 
+    string.IsNullOrWhiteSpace(storageConfig.SecretKey))
+{
+    throw new InvalidOperationException("Storage configuration requires Endpoint, AccessKey, and SecretKey to be non-empty.");
+}
+
 builder.Services.AddMinio(configureClient => configureClient
     .WithEndpoint(storageConfig.Endpoint)
     .WithCredentials(storageConfig.AccessKey, storageConfig.SecretKey)

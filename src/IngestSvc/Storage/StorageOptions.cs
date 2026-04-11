@@ -9,4 +9,6 @@ public sealed class StorageOptions
     public string Bucket { get; set; } = string.Empty;
     public string FullPrefix { get; set; } = string.Empty;
     public string LowPrefix { get; set; } = string.Empty;
+    public int RetryInitialDelayMs { get; set; } = 1000;
+    public int RetryMaxDelayMs { get; set; } = 60000;
 }
