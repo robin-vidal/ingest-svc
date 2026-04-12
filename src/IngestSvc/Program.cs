@@ -31,6 +31,22 @@ if (string.IsNullOrWhiteSpace(storageConfig.Endpoint) ||
     throw new InvalidOperationException("Storage configuration requires Endpoint, AccessKey, and SecretKey to be non-empty.");
 }
 
+var watcherConfig = builder.Configuration.GetSection("Watcher").Get<WatcherOptions>()
+    ?? throw new InvalidOperationException("Watcher configuration is required");
+
+if (string.IsNullOrWhiteSpace(watcherConfig.Path) ||
+    string.IsNullOrWhiteSpace(watcherConfig.ProcessedPath) ||
+    string.IsNullOrWhiteSpace(watcherConfig.FailedPath))
+{
+    throw new InvalidOperationException("Watcher configuration requires Path, ProcessedPath, and FailedPath to be non-empty.");
+}
+
+builder.Services.Configure<HostOptions>(options =>
+{
+    options.ShutdownTimeout = TimeSpan.FromMinutes(5);
+    options.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.StopHost;
+});
+
 builder.Services.AddMinio(configureClient => configureClient
     .WithEndpoint(storageConfig.Endpoint)
     .WithCredentials(storageConfig.AccessKey, storageConfig.SecretKey)

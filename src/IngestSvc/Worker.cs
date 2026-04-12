@@ -17,6 +17,10 @@ public class Worker : BackgroundService
     private readonly IPhotoResizer _resizer;
     private readonly IPhotoUploader _uploader;
     private readonly SemaphoreSlim _semaphore = new(4);
+    private readonly ConcurrentDictionary<Task, byte> _activeTasks = new();
+    private readonly object _lock = new();
+    private bool _isShuttingDown = false;
+    private CancellationToken _stoppingToken;
 
     public Worker(
         ILogger<Worker> logger,
@@ -36,6 +40,13 @@ public class Worker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _stoppingToken = stoppingToken;
+
+        if (!string.IsNullOrWhiteSpace(_options.Value.Path))
+        {
+            Directory.CreateDirectory(_options.Value.Path);
+        }
+
         if (!string.IsNullOrWhiteSpace(_options.Value.ProcessedPath))
         {
             Directory.CreateDirectory(_options.Value.ProcessedPath);
@@ -71,18 +82,53 @@ public class Worker : BackgroundService
         _logger.LogInformation("Watching {Path}", _options.Value.Path);
 
         // Sweep periodically in the background for any missed events or timeouts
-        _ = Task.Run(async () =>
+        var sweepTask = Task.Run(async () =>
         {
-            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
-            SweepDirectory();
-
-            while (await timer.WaitForNextTickAsync(stoppingToken))
+            try
             {
+                using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
                 SweepDirectory();
-            }
-        }, stoppingToken);
 
-        await Task.Delay(Timeout.Infinite, stoppingToken);
+                while (await timer.WaitForNextTickAsync(stoppingToken))
+                {
+                    SweepDirectory();
+                }
+            }
+            catch (OperationCanceledException) { }
+        });
+
+        try
+        {
+            var completedTask = await Task.WhenAny(sweepTask, Task.Delay(Timeout.Infinite, stoppingToken));
+            await completedTask; // bubbles up Faults
+        }
+        catch (OperationCanceledException)
+        {
+            // Allowed to throw during cancellation
+        }
+
+        if (stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogInformation("Stop signal (SIGTERM) is caught correctly.");
+            
+            lock (_lock)
+            {
+                _isShuttingDown = true;
+            }
+
+            watcher.EnableRaisingEvents = false;
+
+            await sweepTask; // Ensure loop terminates completely
+
+            var pendingTasks = _activeTasks.Keys.ToList();
+            if (pendingTasks.Any())
+            {
+                _logger.LogInformation("Waiting for {Count} current file(s) processing to complete...", pendingTasks.Count);
+                await Task.WhenAll(pendingTasks);
+            }
+
+            _logger.LogInformation("Shutdown is logged.");
+        }
     }
 
     private void SweepDirectory()
@@ -91,7 +137,13 @@ public class Worker : BackgroundService
         {
             foreach (var existingFile in Directory.GetFiles(_options.Value.Path, "*.jpg"))
             {
-                _ = Task.Run(() => ProcessSafeAsync(existingFile));
+                lock (_lock)
+                {
+                    if (_isShuttingDown) return;
+                    var task = Task.Run(() => ProcessSafeAsync(existingFile, _stoppingToken));
+                    _activeTasks.TryAdd(task, 0);
+                    _ = task.ContinueWith(t => _activeTasks.TryRemove(t, out _));
+                }
             }
         }
         catch (Exception ex)
@@ -102,17 +154,27 @@ public class Worker : BackgroundService
 
     private void OnFileCreated(object sender, FileSystemEventArgs e)
     {
-        _ = Task.Run(() => ProcessSafeAsync(e.FullPath));
+        lock (_lock)
+        {
+            if (_isShuttingDown) return;
+            var task = Task.Run(() => ProcessSafeAsync(e.FullPath, _stoppingToken));
+            _activeTasks.TryAdd(task, 0);
+            _ = task.ContinueWith(t => _activeTasks.TryRemove(t, out _));
+        }
     }
 
-    private async Task ProcessSafeAsync(string fullPath)
+    private async Task ProcessSafeAsync(string fullPath, CancellationToken token)
     {
         if (!_processingFiles.TryAdd(fullPath, 0))
             return; // Already being processed by sweep or watcher
 
         try
         {
-            await ProcessFileAsync(fullPath);
+            await ProcessFileAsync(fullPath, token);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("Processing cancelled for {Path} due to shutdown.", fullPath);
         }
         catch (Exception ex)
         {
@@ -124,15 +186,15 @@ public class Worker : BackgroundService
         }
     }
 
-    internal async Task ProcessFileAsync(string fullPath)
+    internal async Task ProcessFileAsync(string fullPath, CancellationToken token = default)
     {
-        await WaitForFileReadyAsync(fullPath);
+        await WaitForFileReadyAsync(fullPath, token);
         var key = _namer.Generate();
         _logger.LogInformation("Detected {Path} -> key {Key}", fullPath, key);
 
         bool uploadSuccess = false;
 
-        await _semaphore.WaitAsync();
+        await _semaphore.WaitAsync(token);
         try
         {
             using (var file = File.OpenRead(fullPath))
@@ -177,6 +239,7 @@ public class Worker : BackgroundService
 
     internal static async Task WaitForFileReadyAsync(
         string path,
+        CancellationToken cancellationToken = default,
         int maxAttempts = 240, // 2 minutes timeout to support massive parallel copying
         int delayMs = 500)
     {
@@ -184,6 +247,8 @@ public class Worker : BackgroundService
 
         for (int i = 0; i < maxAttempts; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             try
             {
                 long currentSize = new FileInfo(path).Length;
@@ -205,7 +270,7 @@ public class Worker : BackgroundService
                 // File permissions being set
             }
 
-            await Task.Delay(delayMs);
+            await Task.Delay(delayMs, cancellationToken);
         }
 
         throw new TimeoutException(

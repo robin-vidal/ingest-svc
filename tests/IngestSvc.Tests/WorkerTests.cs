@@ -181,4 +181,148 @@ public class WorkerTests
         
         Directory.Delete(tempDir, true);
     }
+
+    [Fact]
+    public async Task Worker_GracefulShutdown_WaitsForOngoingProcessing()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+        
+        var processedDir = Path.Combine(tempDir, "processed");
+        var failedDir = Path.Combine(tempDir, "failed");
+        Directory.CreateDirectory(processedDir);
+        Directory.CreateDirectory(failedDir);
+        
+        var srcPath = Path.Combine(tempDir, "ongoing.jpg");
+        await File.WriteAllBytesAsync(srcPath, new byte[1024]);
+        
+        var loggerMock = new Mock<ILogger<Worker>>();
+        var optionsMock = new Mock<IOptions<WatcherOptions>>();
+        optionsMock.Setup(o => o.Value).Returns(new WatcherOptions { Path = tempDir, ProcessedPath = processedDir, FailedPath = failedDir });
+        var factoryMock = new Mock<IFileSystemWatcherFactory>();
+        var watcherMock = new FileSystemWatcher(tempDir);
+        factoryMock.Setup(f => f.Create(It.IsAny<string>())).Returns(watcherMock);
+        var namerMock = new Mock<IPhotoNamer>();
+        var resizerMock = new Mock<IPhotoResizer>();
+        resizerMock.Setup(r => r.Resize(It.IsAny<Stream>())).Returns(new MemoryStream());
+        
+        var uploaderMock = new Mock<IPhotoUploader>();
+        var tcs = new TaskCompletionSource();
+        bool uploadStarted = false;
+        
+        uploaderMock.Setup(u => u.UploadAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                uploadStarted = true;
+                await tcs.Task; // Block upload indefinitely until we allow it
+            });
+            
+        var worker = new Worker(loggerMock.Object, optionsMock.Object, factoryMock.Object, namerMock.Object, resizerMock.Object, uploaderMock.Object);
+        
+        var cts = new CancellationTokenSource();
+        var workerTask = worker.StartAsync(cts.Token);
+        
+        try
+        {
+            // Wait till upload is definitely blocked
+            var timeout = DateTime.UtcNow.AddSeconds(5);
+            while (!uploadStarted && DateTime.UtcNow < timeout)
+            {
+                await Task.Delay(100);
+            }
+            
+            Assert.True(uploadStarted, "Upload never started.");
+            
+            // Trigger SIGTERM
+            var stopTask = worker.StopAsync(CancellationToken.None);
+            
+            // stopTask should not complete because uploader is hanging
+            var delayWait = await Task.WhenAny(stopTask, Task.Delay(500));
+            Assert.NotEqual(stopTask, delayWait); // stopTask is still hanging!
+            
+            // Complete the uploader
+            tcs.SetResult();
+            
+            // Now stopTask should gracefully complete
+            await stopTask;
+            
+            Assert.True(File.Exists(Path.Combine(processedDir, "ongoing.jpg")), "File was not moved to processed after wait.");
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+            Directory.Delete(tempDir, true);
+        }
+    }
+    
+    [Fact]
+    public async Task Worker_GracefulShutdown_CancelsPendingInQueue()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+        var processedDir = Path.Combine(tempDir, "processed"); var failedDir = Path.Combine(tempDir, "failed");
+        Directory.CreateDirectory(processedDir); Directory.CreateDirectory(failedDir);
+        
+        var loggerMock = new Mock<ILogger<Worker>>();
+        var optionsMock = new Mock<IOptions<WatcherOptions>>();
+        optionsMock.Setup(o => o.Value).Returns(new WatcherOptions { Path = tempDir, ProcessedPath = processedDir, FailedPath = failedDir });
+        var factoryMock = new Mock<IFileSystemWatcherFactory>();
+        var watcherMock = new FileSystemWatcher(tempDir);
+        factoryMock.Setup(f => f.Create(It.IsAny<string>())).Returns(watcherMock);
+        var namerMock = new Mock<IPhotoNamer>();
+        var resizerMock = new Mock<IPhotoResizer>();
+        resizerMock.Setup(r => r.Resize(It.IsAny<Stream>())).Returns(new MemoryStream());
+        
+        var uploaderMock = new Mock<IPhotoUploader>();
+        var tcs = new TaskCompletionSource();
+        int activeUploads = 0;
+        
+        uploaderMock.Setup(u => u.UploadAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                Interlocked.Increment(ref activeUploads);
+                await tcs.Task; // block all
+            });
+            
+        var worker = new Worker(loggerMock.Object, optionsMock.Object, factoryMock.Object, namerMock.Object, resizerMock.Object, uploaderMock.Object);
+        var cts = new CancellationTokenSource();
+        
+        // Since maximum concurrency is 4 (SemaphoreSlim = 4)
+        // Let's create 5 files BEFORE starting the worker
+        for (int i = 0; i < 5; i++)
+        {
+            var p = Path.Combine(tempDir, $"file_{i}.jpg");
+            await File.WriteAllBytesAsync(p, new byte[100]);
+        }
+        
+        await worker.StartAsync(cts.Token);
+        
+        try
+        {
+            // Wait for 4 of them to hit the uploader (the 5th will be stuck in wait)
+            var timeout = DateTime.UtcNow.AddSeconds(5);
+            while (activeUploads < 4 && DateTime.UtcNow < timeout)
+            {
+                await Task.Delay(100);
+            }
+            
+            Assert.Equal(4, activeUploads);
+            
+            // Stop service. The 5th task should be cancelled instantly!
+            var stopTask = worker.StopAsync(CancellationToken.None);
+            
+            // Release the 4 workers
+            tcs.SetResult();
+            
+            await stopTask;
+            
+            // The 5th should NEVER have started upload!
+            Assert.Equal(4, activeUploads);
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+            Directory.Delete(tempDir, true);
+        }
+    }
 }
