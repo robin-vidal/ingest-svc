@@ -21,34 +21,68 @@ flowchart LR
 
 ## Requirements
 
-- .NET 8 SDK
-- MinIO accessible on `localhost:9000` (via Docker)
-
-> MinIO is managed by [stand-infra](https://github.com/Association-Ephemere/stand-infra). Run docker compose up there first.
+- .NET 8 SDK — for local development
+- Docker — for running via container
+- MinIO bucket accessible on the network
 
 ## Configuration
 
-Create an `appsettings.local.json` file at the root (not committed):
+Create an `appsettings.local.json` file at the root (not committed), or use environment variables with `__` as section separator (e.g. `Watcher__StandId=stand-1`):
 
 ```json
 {
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information"
+    }
+  },
   "Watcher": {
-    "Path": "C:\\path\\to\\watch"
+    "Path": "/path/to/watch",
+    "StandId": "stand-id-here",
+    "ProcessedPath": "/path/to/processed",
+    "FailedPath": "/path/to/failed"
+  },
+  "Resize": {
+    "MaxWidth": 800,
+    "MaxHeight": 800
   },
   "Storage": {
     "Endpoint": "localhost:9000",
     "AccessKey": "minioadmin",
     "SecretKey": "minioadmin",
+    "UseSSL": false,
     "Bucket": "photos",
     "FullPrefix": "full",
-    "LowPrefix": "low"
-  },
-  "Resize": {
-    "MaxWidth": 800,
-    "MaxHeight": 800
+    "LowPrefix": "low",
+    "RetryInitialDelayMs": 1000,
+    "RetryMaxDelayMs": 60000
   }
 }
 ```
+
+## Run with Docker
+
+```bash
+docker pull ghcr.io/association-ephemere/ingest-svc:latest
+```
+
+```bash
+docker run \
+  -e Watcher__Path=/data/watch \
+  -e Watcher__StandId=stand-id-here \
+  -e Watcher__ProcessedPath=/data/processed \
+  -e Watcher__FailedPath=/data/failed \
+  -e Storage__Endpoint=<minio-host>:9000 \
+  -e Storage__AccessKey=<access-key> \
+  -e Storage__SecretKey=<secret-key> \
+  -e Storage__Bucket=photos \
+  -v /path/to/watch:/data/watch \
+  -v /path/to/processed:/data/processed \
+  -v /path/to/failed:/data/failed \
+  ghcr.io/association-ephemere/ingest-svc:latest
+```
+
+> On Windows with Docker Desktop, use `host.docker.internal` to reach MinIO running on the host machine.
 
 ## Run in development
 
